@@ -10,7 +10,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/moby/moby/api/types/container"
 	"github.com/moby/moby/client"
 	"github.com/fsnotify/fsnotify"
 	"github.com/redis/go-redis/v9"
@@ -189,7 +188,8 @@ func runClient() {
 	restartTraefik := func() {
 		timeout := 30 // Increased timeout for larger instances
 		err := retryWithBackoff(ctx, func() error {
-			return dockerClient.ContainerRestart(ctx, traefikContainer, container.StopOptions{Timeout: &timeout})
+			_, err := dockerClient.ContainerRestart(ctx, traefikContainer, client.ContainerRestartOptions{Timeout: &timeout})
+			return err
 		}, "Traefik restart")
 
 		if err != nil {
