@@ -7,3 +7,6 @@
 *.pem
 *.crt
 acme.json
+
+# Go
+cert-sync
