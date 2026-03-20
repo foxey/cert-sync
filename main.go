@@ -179,16 +179,17 @@ func runClient() {
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
-	dockerClient, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	dockerClient, err := client.New(client.FromEnv)
 	if err != nil {
 		log.Fatalf("[cert-sync:client] ERROR: could not connect to Docker: %v", err)
 	}
 	defer dockerClient.Close()
 
-	// Force a ping so API version negotiation happens before any real calls.
-	// Without this, the first API call may use the SDK's default version (1.53)
-	// which is too new for older Docker daemons (e.g. Synology DSM's 24.0.2 / API 1.43).
-	if _, err := dockerClient.Ping(ctx); err != nil {
+	// Ping with NegotiateAPIVersion so the client downgrades to whatever the
+	// daemon supports. This replaces the deprecated WithAPIVersionNegotiation()
+	// and ensures older daemons (e.g. Synology DSM 24.0.2 / API 1.43) work
+	// without rejecting the SDK's default API version (1.53).
+	if _, err := dockerClient.Ping(ctx, client.PingOptions{NegotiateAPIVersion: true}); err != nil {
 		log.Printf("[cert-sync:client] WARNING: Docker ping failed (version negotiation may be incomplete): %v", err)
 	}
 
