@@ -4,26 +4,28 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"syscall"
 	"time"
 
-	"github.com/moby/moby/client"
 	"github.com/fsnotify/fsnotify"
 	"github.com/redis/go-redis/v9"
 )
 
 const (
-	defaultRedisHost      = "redis"
-	defaultRedisPort      = "6379"
-	defaultRedisKey       = "traefik:acme.json"
-	defaultAcmeFile       = "/acme/acme.json"
-	defaultPollInterval   = time.Hour
-	redisPubSubChannel    = "traefik:acme:updated"
-	maxRetries            = 5
-	initialRetryDelay     = time.Second
+	defaultRedisHost    = "redis"
+	defaultRedisPort    = "6379"
+	defaultRedisKey     = "traefik:acme.json"
+	defaultAcmeFile     = "/acme/acme.json"
+	defaultDockerSocket = "/var/run/docker.sock"
+	defaultPollInterval = time.Hour
+	redisPubSubChannel  = "traefik:acme:updated"
+	maxRetries          = 5
+	initialRetryDelay   = time.Second
 )
 
 func getEnv(key, fallback string) string {
@@ -52,6 +54,21 @@ func newRedisClient() *redis.Client {
 	})
 }
 
+// newDockerHTTPClient creates an HTTP client that talks to the Docker daemon
+// via the Unix socket. This bypasses the moby SDK's minimum API version
+// enforcement, allowing us to work with any Docker daemon version.
+func newDockerHTTPClient() *http.Client {
+	socketPath := getEnv("DOCKER_HOST", defaultDockerSocket)
+	return &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(_ context.Context, _, _ string) (net.Conn, error) {
+				return net.Dial("unix", socketPath)
+			},
+		},
+		Timeout: 60 * time.Second,
+	}
+}
+
 func retryWithBackoff(ctx context.Context, operation func() error, operationName string) error {
 	var err error
 	delay := initialRetryDelay
@@ -63,9 +80,9 @@ func retryWithBackoff(ctx context.Context, operation func() error, operationName
 		}
 
 		if attempt < maxRetries {
-			log.Printf("[cert-sync] %s failed (attempt %d/%d): %v, retrying in %v...", 
+			log.Printf("[cert-sync] %s failed (attempt %d/%d): %v, retrying in %v...",
 				operationName, attempt, maxRetries, err, delay)
-			
+
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
@@ -179,25 +196,22 @@ func runClient() {
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
-	dockerClient, err := client.New(client.FromEnv)
-	if err != nil {
-		log.Fatalf("[cert-sync:client] ERROR: could not connect to Docker: %v", err)
-	}
-	defer dockerClient.Close()
-
-	// Ping with NegotiateAPIVersion so the client downgrades to whatever the
-	// daemon supports. This replaces the deprecated WithAPIVersionNegotiation()
-	// and ensures older daemons (e.g. Synology DSM 24.0.2 / API 1.43) work
-	// without rejecting the SDK's default API version (1.53).
-	if _, err := dockerClient.Ping(ctx, client.PingOptions{NegotiateAPIVersion: true}); err != nil {
-		log.Printf("[cert-sync:client] WARNING: Docker ping failed (version negotiation may be incomplete): %v", err)
-	}
+	dockerHTTP := newDockerHTTPClient()
 
 	restartTraefik := func() {
-		timeout := 30 // Increased timeout for larger instances
 		err := retryWithBackoff(ctx, func() error {
-			_, err := dockerClient.ContainerRestart(ctx, traefikContainer, client.ContainerRestartOptions{Timeout: &timeout})
-			return err
+			// POST to the Docker Engine API directly via the Unix socket.
+			// Using a versionless URL path avoids any API version mismatch.
+			url := fmt.Sprintf("http://localhost/containers/%s/restart?t=30", traefikContainer)
+			resp, err := dockerHTTP.Post(url, "", nil)
+			if err != nil {
+				return err
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusNoContent {
+				return fmt.Errorf("unexpected status %d", resp.StatusCode)
+			}
+			return nil
 		}, "Traefik restart")
 
 		if err != nil {
@@ -277,7 +291,7 @@ func runClient() {
 			default:
 				log.Printf("[cert-sync:client] Subscribing to %s...", redisPubSubChannel)
 				sub := rdb.Subscribe(ctx, redisPubSubChannel)
-				
+
 				func() {
 					defer sub.Close()
 					for {
