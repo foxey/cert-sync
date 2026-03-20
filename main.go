@@ -185,6 +185,13 @@ func runClient() {
 	}
 	defer dockerClient.Close()
 
+	// Force a ping so API version negotiation happens before any real calls.
+	// Without this, the first API call may use the SDK's default version (1.53)
+	// which is too new for older Docker daemons (e.g. Synology DSM's 24.0.2 / API 1.43).
+	if _, err := dockerClient.Ping(ctx); err != nil {
+		log.Printf("[cert-sync:client] WARNING: Docker ping failed (version negotiation may be incomplete): %v", err)
+	}
+
 	restartTraefik := func() {
 		timeout := 30 // Increased timeout for larger instances
 		err := retryWithBackoff(ctx, func() error {
