@@ -221,7 +221,7 @@ func runClient() {
 		log.Printf("[cert-sync:client] Restarted %s", traefikContainer)
 	}
 
-	sync := func() {
+	sync := func(forceRestart bool) {
 		var value []byte
 		err := retryWithBackoff(ctx, func() error {
 			var err error
@@ -245,7 +245,12 @@ func runClient() {
 		// Only update and restart if content changed
 		current, err := os.ReadFile(acmeFile)
 		if err == nil && string(current) == string(value) {
-			log.Printf("[cert-sync:client] acme.json unchanged, skipping restart.")
+			if forceRestart {
+				log.Printf("[cert-sync:client] acme.json unchanged, but force restart requested.")
+				restartTraefik()
+			} else {
+				log.Printf("[cert-sync:client] acme.json unchanged, skipping restart.")
+			}
 			return
 		}
 
@@ -265,7 +270,8 @@ func runClient() {
 	}
 
 	// Initial sync on startup
-	sync()
+	forceRestart := os.Getenv("CERT_SYNC_FORCE_RESTART") == "true"
+	sync(forceRestart)
 
 	// Hourly fallback poll
 	go func() {
@@ -277,7 +283,7 @@ func runClient() {
 				return
 			case <-ticker.C:
 				log.Printf("[cert-sync:client] Polling Redis...")
-				sync()
+				sync(false)
 			}
 		}
 	}()
@@ -304,7 +310,7 @@ func runClient() {
 								return
 							}
 							log.Printf("[cert-sync:client] Received update notification (msg: %s), syncing...", msg.Payload)
-							sync()
+							sync(false)
 						}
 					}
 				}()
