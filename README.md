@@ -6,6 +6,8 @@ ACME certificate synchronization over Redis for distributed Traefik deployments.
 
 cert-sync enables automatic certificate synchronization across multiple Traefik instances using Redis as a message broker. When Traefik generates or renews ACME certificates, the server mode watches for changes and pushes them to Redis. Client instances subscribe to updates and automatically restart their Traefik containers with the new certificates.
 
+Communicates with the Docker daemon directly via the Unix socket, auto-detecting the API version at startup. This makes it compatible with a wide range of Docker versions without requiring the Docker CLI or SDK.
+
 ## Modes
 
 ### Server Mode
@@ -28,6 +30,8 @@ Subscribes to Redis for certificate updates, syncs the local ACME file, and rest
 - `REDIS_PASSWORD` - Redis password (default: none)
 - `REDIS_KEY` - Redis key for certificate storage (default: `traefik:acme.json`)
 - `TRAEFIK_ACME_FILE` - Path to ACME certificate file (default: `/acme/acme.json`)
+- `DOCKER_HOST` - Path to Docker socket (default: `/var/run/docker.sock`)
+- `CERT_SYNC_FORCE_RESTART` - Force a Traefik restart on startup even if the certificate file is unchanged. Accepts `1`, `true`, `yes` (and uppercase variants). Useful after deploying a new cert-sync version or when Traefik needs a restart for other reasons.
 
 ## Usage
 
