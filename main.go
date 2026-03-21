@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net"
@@ -69,6 +70,27 @@ func newDockerHTTPClient() *http.Client {
 		Timeout: 60 * time.Second,
 	}
 }
+
+// detectAPIVersion pings the Docker daemon and returns the API version
+// it reports. Falls back to "1.24" if the ping fails.
+func detectAPIVersion(client *http.Client) string {
+	resp, err := client.Get("http://localhost/version")
+	if err != nil {
+		log.Printf("[cert-sync:client] WARNING: could not detect Docker API version: %v, falling back to 1.24", err)
+		return "1.24"
+	}
+	defer resp.Body.Close()
+
+	var info struct {
+		APIVersion string `json:"ApiVersion"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&info); err != nil || info.APIVersion == "" {
+		log.Printf("[cert-sync:client] WARNING: could not parse Docker version response, falling back to 1.24")
+		return "1.24"
+	}
+	return info.APIVersion
+}
+
 
 func retryWithBackoff(ctx context.Context, operation func() error, operationName string) error {
 	var err error
@@ -199,12 +221,14 @@ func runClient() {
 
 	dockerHTTP := newDockerHTTPClient()
 
+	// Detect the Docker daemon's API version via ping.
+	dockerAPIVersion := detectAPIVersion(dockerHTTP)
+	log.Printf("[cert-sync:client] Using Docker API version %s", dockerAPIVersion)
+
 	restartTraefik := func() {
 		err := retryWithBackoff(ctx, func() error {
 			// POST to the Docker Engine API directly via the Unix socket.
-			// Using API v1.24 (minimum supported by all target daemons) to
-			// ensure compatibility across Docker versions.
-			url := fmt.Sprintf("http://localhost/v1.24/containers/%s/restart?t=30", traefikContainer)
+			url := fmt.Sprintf("http://localhost/v%s/containers/%s/restart?t=30", dockerAPIVersion, traefikContainer)
 			resp, err := dockerHTTP.Post(url, "", nil)
 			if err != nil {
 				return err
