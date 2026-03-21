@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -271,7 +272,7 @@ func runClient() {
 	}
 
 	// Initial sync on startup
-	forceRestart := os.Getenv("CERT_SYNC_FORCE_RESTART") == "true"
+	forceRestart, _ := strconv.ParseBool(os.Getenv("CERT_SYNC_FORCE_RESTART"))
 	sync(forceRestart)
 
 	// Hourly fallback poll
