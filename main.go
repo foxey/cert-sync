@@ -201,8 +201,9 @@ func runClient() {
 	restartTraefik := func() {
 		err := retryWithBackoff(ctx, func() error {
 			// POST to the Docker Engine API directly via the Unix socket.
-			// Using a versionless URL path avoids any API version mismatch.
-			url := fmt.Sprintf("http://localhost/containers/%s/restart?t=30", traefikContainer)
+			// Using API v1.24 (minimum supported by all target daemons) to
+			// ensure compatibility across Docker versions.
+			url := fmt.Sprintf("http://localhost/v1.24/containers/%s/restart?t=30", traefikContainer)
 			resp, err := dockerHTTP.Post(url, "", nil)
 			if err != nil {
 				return err
