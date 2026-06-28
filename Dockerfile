@@ -16,4 +16,5 @@ COPY --from=builder /build/cert-sync /cert-sync
 # Needed if Redis is configured with TLS
 COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
 
+HEALTHCHECK CMD ["/cert-sync", "--healthcheck"]
 ENTRYPOINT ["/cert-sync"]

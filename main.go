@@ -358,10 +358,47 @@ func runClient() {
 	time.Sleep(time.Second) // Give goroutines time to clean up
 }
 
+// --- Healthcheck ---
+
+func runHealthcheck(mode string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	acmeFile := getEnv("TRAEFIK_ACME_FILE", defaultAcmeFile)
+	if _, err := os.Stat(acmeFile); err != nil {
+		fmt.Fprintf(os.Stderr, "acme file: %v\n", err)
+		os.Exit(1)
+	}
+
+	rdb := newRedisClient()
+	defer rdb.Close()
+	if err := rdb.Ping(ctx).Err(); err != nil {
+		fmt.Fprintf(os.Stderr, "redis: %v\n", err)
+		os.Exit(1)
+	}
+
+	if mode == "client" {
+		dockerHTTP := newDockerHTTPClient()
+		req, _ := http.NewRequestWithContext(ctx, "GET", "http://localhost/_ping", nil)
+		resp, err := dockerHTTP.Do(req)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "docker: %v\n", err)
+			os.Exit(1)
+		}
+		resp.Body.Close()
+	}
+
+	os.Exit(0)
+}
+
 // --- Main ---
 
 func main() {
 	mode := requireEnv("CERT_SYNC_MODE")
+
+	if len(os.Args) > 1 && os.Args[1] == "--healthcheck" {
+		runHealthcheck(mode)
+	}
 
 	switch mode {
 	case "server":
