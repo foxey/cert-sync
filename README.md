@@ -19,10 +19,12 @@ Subscribes to Redis for certificate updates, syncs the local ACME file, and rest
 ### Home Assistant Mode
 Subscribes to Redis for certificate updates and installs the certificate directly
 for Home Assistant Core (no Traefik container involved on this side). Intended
-to run as a Home Assistant App — see [`cert_sync/`](cert_sync/) and
-[`cert_sync/DOCS.md`](cert_sync/DOCS.md) for installing it that way via a custom
-App Store repository. Can also run standalone as a container, same as the other
-modes.
+to run as a Home Assistant App, packaged and published from
+[foxey/home-assistant-apps](https://github.com/foxey/home-assistant-apps) — add
+that repository as a custom App Store repository in Home Assistant to install it.
+This repo only builds and publishes the image (see `home-assistant-app/Dockerfile` and
+`.github/workflows/build-ha-app.yml`); it can also run standalone as a
+container, same as the other modes.
 
 ## Configuration
 
@@ -90,4 +92,3 @@ docker build -t cert-sync:latest .
 ## License
 
 See LICENSE file for details.
-
