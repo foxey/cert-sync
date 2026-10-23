@@ -8,6 +8,13 @@ on:
       - "main.go"
       - "go.mod"
       - "go.sum"
+  pull_request:
+    paths:
+      - "cert_sync/**"
+      - "main.go"
+      - "go.mod"
+      - "go.sum"
+      - ".github/workflows/build-ha-app.yml"
   workflow_dispatch: {}
 
 jobs:
