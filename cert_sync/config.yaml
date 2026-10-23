@@ -3,6 +3,7 @@ version: "1.0.0"
 slug: "cert_sync"
 description: "Syncs an ACME certificate from Redis directly into Home Assistant Core"
 url: "https://github.com/foxey/cert-sync"
+image: "ghcr.io/foxey/cert-sync-homeassistant"
 arch:
   - amd64
   - aarch64
