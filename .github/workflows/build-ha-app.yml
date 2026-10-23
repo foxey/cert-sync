@@ -8,12 +8,14 @@ on:
       - "main.go"
       - "go.mod"
       - "go.sum"
+      - "VERSION"
   pull_request:
     paths:
       - "cert_sync/**"
       - "main.go"
       - "go.mod"
       - "go.sum"
+      - "VERSION"
       - ".github/workflows/build-ha-app.yml"
   workflow_dispatch: {}
 
@@ -26,7 +28,7 @@ jobs:
       - uses: actions/checkout@v4
       - id: version
         run: |
-          echo "version=$(grep '^version:' cert_sync/config.yaml | sed -E 's/version: *"([^"]+)"/\1/')" >> "$GITHUB_OUTPUT"
+          echo "version=$(cat VERSION)" >> "$GITHUB_OUTPUT"
 
   build:
     needs: version
