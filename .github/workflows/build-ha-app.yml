@@ -1,4 +1,4 @@
-name: Build HA App image # re-trigger test run
+name: Build HA App image
 
 on:
   push:
@@ -25,7 +25,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - id: version
-        run: echo "version=$(grep '^version:' cert_sync/config.yaml | sed -E 's/version: *"([^"]+)"/\1/')" >> "$GITHUB_OUTPUT"
+        run: |
+          echo "version=$(grep '^version:' cert_sync/config.yaml | sed -E 's/version: *"([^"]+)"/\1/')" >> "$GITHUB_OUTPUT"
 
   build:
     needs: version
