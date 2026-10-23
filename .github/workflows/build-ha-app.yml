@@ -1,4 +1,4 @@
-name: Build HA App image
+name: Build HA App image # re-trigger test run
 
 on:
   push:
