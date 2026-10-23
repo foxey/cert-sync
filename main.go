@@ -500,7 +500,52 @@ func restartCore(ctx context.Context) error {
 	return nil
 }
 
+// haOptions mirrors the `options`/`schema` in cert_sync/config.yaml. The
+// Supervisor writes the user's configured values here before starting the
+// container; apps without bashio read it directly instead of getting
+// options as environment variables.
+type haOptions struct {
+	RedisHost     string `json:"redis_host"`
+	RedisPort     int    `json:"redis_port"`
+	RedisPassword string `json:"redis_password"`
+	RedisKey      string `json:"redis_key"`
+	Domain        string `json:"domain"`
+	RestartWindow string `json:"restart_window"`
+}
+
+// loadHAOptions reads /data/options.json and applies it on top of the
+// CERT_SYNC_MODE=homeassistant environment variable defaults, since the
+// Supervisor does not expose app options as environment variables.
+func loadHAOptions(path string) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		log.Printf("[cert-sync:homeassistant] WARNING: could not read %s: %v", path, err)
+		return
+	}
+
+	var opts haOptions
+	if err := json.Unmarshal(data, &opts); err != nil {
+		log.Printf("[cert-sync:homeassistant] WARNING: could not parse %s: %v", path, err)
+		return
+	}
+
+	if opts.RedisHost != "" {
+		os.Setenv("REDIS_HOST", opts.RedisHost)
+	}
+	if opts.RedisPort != 0 {
+		os.Setenv("REDIS_PORT", strconv.Itoa(opts.RedisPort))
+	}
+	os.Setenv("REDIS_PASSWORD", opts.RedisPassword)
+	if opts.RedisKey != "" {
+		os.Setenv("REDIS_KEY", opts.RedisKey)
+	}
+	os.Setenv("CERT_SYNC_DOMAIN", opts.Domain)
+	os.Setenv("CERT_SYNC_RESTART_WINDOW", opts.RestartWindow)
+}
+
 func runHomeAssistant() {
+	loadHAOptions(getEnv("CERT_SYNC_OPTIONS_FILE", "/data/options.json"))
+
 	redisKey := getEnv("REDIS_KEY", defaultRedisKey)
 	sslDir := getEnv("CERT_SYNC_SSL_DIR", defaultSSLDir)
 	domain := os.Getenv("CERT_SYNC_DOMAIN")
