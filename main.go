@@ -121,6 +121,91 @@ func retryWithBackoff(ctx context.Context, operation func() error, operationName
 	return fmt.Errorf("%s failed after %d attempts: %w", operationName, maxRetries, err)
 }
 
+// fetchFromRedis reads redisKey with retry, treating a missing key as "no
+// update" (nil, nil) rather than an error.
+func fetchFromRedis(ctx context.Context, rdb *redis.Client, redisKey, label string) ([]byte, error) {
+	var value []byte
+	err := retryWithBackoff(ctx, func() error {
+		var err error
+		value, err = rdb.Get(ctx, redisKey).Bytes()
+		if err == redis.Nil {
+			log.Printf("[cert-sync:%s] WARNING: no data found in Redis for key %s", label, redisKey)
+			return nil
+		}
+		return err
+	}, "Redis GET")
+	return value, err
+}
+
+// runSyncDaemon runs the hourly fallback poll and pub/sub subscription loops
+// shared by client and homeassistant modes, performing an initial sync on
+// startup, then blocks until a shutdown signal is received.
+func runSyncDaemon(ctx context.Context, cancel context.CancelFunc, rdb *redis.Client, label string, pollInterval time.Duration, sync func(forceRestart bool)) {
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+	forceRestart, _ := strconv.ParseBool(os.Getenv("CERT_SYNC_FORCE_RESTART"))
+	sync(forceRestart)
+
+	// Hourly fallback poll
+	go func() {
+		ticker := time.NewTicker(pollInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				log.Printf("[cert-sync:%s] Polling Redis...", label)
+				sync(false)
+			}
+		}
+	}()
+
+	// Subscribe for immediate notifications with reconnection logic
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				log.Printf("[cert-sync:%s] Subscribing to %s...", label, redisPubSubChannel)
+				sub := rdb.Subscribe(ctx, redisPubSubChannel)
+
+				func() {
+					defer sub.Close()
+					for {
+						select {
+						case <-ctx.Done():
+							return
+						case msg, ok := <-sub.Channel():
+							if !ok {
+								log.Printf("[cert-sync:%s] Subscription closed, reconnecting...", label)
+								return
+							}
+							log.Printf("[cert-sync:%s] Received update notification (msg: %s), syncing...", label, msg.Payload)
+							sync(false)
+						}
+					}
+				}()
+
+				// Wait before reconnecting
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(5 * time.Second):
+				}
+			}
+		}
+	}()
+
+	// Wait for shutdown signal
+	<-sigChan
+	log.Printf("[cert-sync:%s] Received shutdown signal, exiting gracefully...", label)
+	cancel()
+	time.Sleep(time.Second) // Give goroutines time to clean up
+}
+
 // --- Server ---
 
 func runServer() {
@@ -218,10 +303,6 @@ func runClient() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Setup signal handling
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-
 	dockerHTTP := newDockerHTTPClient()
 
 	// Detect the Docker daemon's API version via ping.
@@ -251,22 +332,11 @@ func runClient() {
 	}
 
 	sync := func(forceRestart bool) {
-		var value []byte
-		err := retryWithBackoff(ctx, func() error {
-			var err error
-			value, err = rdb.Get(ctx, redisKey).Bytes()
-			if err == redis.Nil {
-				log.Printf("[cert-sync:client] WARNING: no data found in Redis for key %s", redisKey)
-				return nil // Don't retry for missing key
-			}
-			return err
-		}, "Redis GET")
-
+		value, err := fetchFromRedis(ctx, rdb, redisKey, "client")
 		if err != nil {
 			log.Printf("[cert-sync:client] ERROR: %v", err)
 			return
 		}
-
 		if value == nil {
 			return // No data in Redis
 		}
@@ -298,67 +368,7 @@ func runClient() {
 		restartTraefik()
 	}
 
-	// Initial sync on startup
-	forceRestart, _ := strconv.ParseBool(os.Getenv("CERT_SYNC_FORCE_RESTART"))
-	sync(forceRestart)
-
-	// Hourly fallback poll
-	go func() {
-		ticker := time.NewTicker(pollInterval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				log.Printf("[cert-sync:client] Polling Redis...")
-				sync(false)
-			}
-		}
-	}()
-
-	// Subscribe for immediate notifications with reconnection logic
-	go func() {
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			default:
-				log.Printf("[cert-sync:client] Subscribing to %s...", redisPubSubChannel)
-				sub := rdb.Subscribe(ctx, redisPubSubChannel)
-
-				func() {
-					defer sub.Close()
-					for {
-						select {
-						case <-ctx.Done():
-							return
-						case msg, ok := <-sub.Channel():
-							if !ok {
-								log.Printf("[cert-sync:client] Subscription closed, reconnecting...")
-								return
-							}
-							log.Printf("[cert-sync:client] Received update notification (msg: %s), syncing...", msg.Payload)
-							sync(false)
-						}
-					}
-				}()
-
-				// Wait before reconnecting
-				select {
-				case <-ctx.Done():
-					return
-				case <-time.After(5 * time.Second):
-				}
-			}
-		}
-	}()
-
-	// Wait for shutdown signal
-	<-sigChan
-	log.Printf("[cert-sync:client] Received shutdown signal, exiting gracefully...")
-	cancel()
-	time.Sleep(time.Second) // Give goroutines time to clean up
+	runSyncDaemon(ctx, cancel, rdb, "client", pollInterval, sync)
 }
 
 // --- Home Assistant ---
@@ -505,9 +515,6 @@ func runHomeAssistant() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-
 	var pendingRestart atomic.Bool
 
 	applyRestart := func() {
@@ -529,16 +536,7 @@ func runHomeAssistant() {
 	}
 
 	sync := func(forceRestart bool) {
-		var value []byte
-		err := retryWithBackoff(ctx, func() error {
-			var err error
-			value, err = rdb.Get(ctx, redisKey).Bytes()
-			if err == redis.Nil {
-				log.Printf("[cert-sync:homeassistant] WARNING: no data found in Redis for key %s", redisKey)
-				return nil
-			}
-			return err
-		}, "Redis GET")
+		value, err := fetchFromRedis(ctx, rdb, redisKey, "homeassistant")
 		if err != nil {
 			log.Printf("[cert-sync:homeassistant] ERROR: %v", err)
 			return
@@ -573,60 +571,6 @@ func runHomeAssistant() {
 		scheduleRestart()
 	}
 
-	forceRestart, _ := strconv.ParseBool(os.Getenv("CERT_SYNC_FORCE_RESTART"))
-	sync(forceRestart)
-
-	// Hourly fallback poll
-	go func() {
-		ticker := time.NewTicker(defaultPollInterval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				log.Printf("[cert-sync:homeassistant] Polling Redis...")
-				sync(false)
-			}
-		}
-	}()
-
-	// Subscribe for immediate notifications with reconnection logic
-	go func() {
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			default:
-				log.Printf("[cert-sync:homeassistant] Subscribing to %s...", redisPubSubChannel)
-				sub := rdb.Subscribe(ctx, redisPubSubChannel)
-
-				func() {
-					defer sub.Close()
-					for {
-						select {
-						case <-ctx.Done():
-							return
-						case msg, ok := <-sub.Channel():
-							if !ok {
-								log.Printf("[cert-sync:homeassistant] Subscription closed, reconnecting...")
-								return
-							}
-							log.Printf("[cert-sync:homeassistant] Received update notification (msg: %s), syncing...", msg.Payload)
-							sync(false)
-						}
-					}
-				}()
-
-				select {
-				case <-ctx.Done():
-					return
-				case <-time.After(5 * time.Second):
-				}
-			}
-		}
-	}()
-
 	// Apply a deferred restart once the configured window opens
 	if window != nil {
 		go func() {
@@ -645,10 +589,7 @@ func runHomeAssistant() {
 		}()
 	}
 
-	<-sigChan
-	log.Printf("[cert-sync:homeassistant] Received shutdown signal, exiting gracefully...")
-	cancel()
-	time.Sleep(time.Second)
+	runSyncDaemon(ctx, cancel, rdb, "homeassistant", defaultPollInterval, sync)
 }
 
 // --- Healthcheck ---
