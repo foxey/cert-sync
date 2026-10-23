@@ -22,7 +22,7 @@ for Home Assistant Core (no Traefik container involved on this side). Intended
 to run as a Home Assistant App, packaged and published from
 [foxey/home-assistant-apps](https://github.com/foxey/home-assistant-apps) — add
 that repository as a custom App Store repository in Home Assistant to install it.
-This repo only builds and publishes the image (see `cert_sync/Dockerfile` and
+This repo only builds and publishes the image (see `home-assistant-app/Dockerfile` and
 `.github/workflows/build-ha-app.yml`); it can also run standalone as a
 container, same as the other modes.
 

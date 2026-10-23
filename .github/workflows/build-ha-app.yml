@@ -4,14 +4,14 @@ on:
   push:
     branches: [main]
     paths:
-      - "cert_sync/**"
+      - "home-assistant-app/**"
       - "main.go"
       - "go.mod"
       - "go.sum"
       - "VERSION"
   pull_request:
     paths:
-      - "cert_sync/**"
+      - "home-assistant-app/**"
       - "main.go"
       - "go.mod"
       - "go.sum"
@@ -53,12 +53,12 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      # Build context is the repo root (not cert_sync/) so the Dockerfile's
-      # COPY of go.mod/go.sum/main.go can find them.
+      # Build context is the repo root (not home-assistant-app/) so the
+      # Dockerfile's COPY of go.mod/go.sum/main.go can find them.
       - uses: docker/build-push-action@v6
         with:
           context: .
-          file: cert_sync/Dockerfile
+          file: home-assistant-app/Dockerfile
           platforms: ${{ matrix.platform }}
           push: ${{ github.event_name == 'push' }}
           build-args: |

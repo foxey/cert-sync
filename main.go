@@ -500,7 +500,8 @@ func restartCore(ctx context.Context) error {
 	return nil
 }
 
-// haOptions mirrors the `options`/`schema` in cert_sync/config.yaml. The
+// haOptions mirrors the `options`/`schema` in home-assistant-apps'
+// cert_sync/config.yaml. The
 // Supervisor writes the user's configured values here before starting the
 // container; apps without bashio read it directly instead of getting
 // options as environment variables.
