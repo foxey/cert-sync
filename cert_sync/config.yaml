@@ -7,7 +7,6 @@ image: "ghcr.io/foxey/cert-sync-homeassistant"
 arch:
   - amd64
   - aarch64
-  - armv7
 startup: application
 hassio_api: true
 hassio_role: homeassistant
