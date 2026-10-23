@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -11,6 +12,8 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strconv"
+	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -24,6 +27,7 @@ const (
 	defaultRedisKey     = "traefik:acme.json"
 	defaultAcmeFile     = "/acme/acme.json"
 	defaultDockerSocket = "/var/run/docker.sock"
+	defaultSSLDir       = "/ssl"
 	defaultPollInterval = time.Hour
 	redisPubSubChannel  = "traefik:acme:updated"
 	maxRetries          = 5
@@ -91,7 +95,6 @@ func detectAPIVersion(client *http.Client) string {
 	return info.APIVersion
 }
 
-
 func retryWithBackoff(ctx context.Context, operation func() error, operationName string) error {
 	var err error
 	delay := initialRetryDelay
@@ -116,6 +119,91 @@ func retryWithBackoff(ctx context.Context, operation func() error, operationName
 	}
 
 	return fmt.Errorf("%s failed after %d attempts: %w", operationName, maxRetries, err)
+}
+
+// fetchFromRedis reads redisKey with retry, treating a missing key as "no
+// update" (nil, nil) rather than an error.
+func fetchFromRedis(ctx context.Context, rdb *redis.Client, redisKey, label string) ([]byte, error) {
+	var value []byte
+	err := retryWithBackoff(ctx, func() error {
+		var err error
+		value, err = rdb.Get(ctx, redisKey).Bytes()
+		if err == redis.Nil {
+			log.Printf("[cert-sync:%s] WARNING: no data found in Redis for key %s", label, redisKey)
+			return nil
+		}
+		return err
+	}, "Redis GET")
+	return value, err
+}
+
+// runSyncDaemon runs the hourly fallback poll and pub/sub subscription loops
+// shared by client and homeassistant modes, performing an initial sync on
+// startup, then blocks until a shutdown signal is received.
+func runSyncDaemon(ctx context.Context, cancel context.CancelFunc, rdb *redis.Client, label string, pollInterval time.Duration, sync func(forceRestart bool)) {
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+	forceRestart, _ := strconv.ParseBool(os.Getenv("CERT_SYNC_FORCE_RESTART"))
+	sync(forceRestart)
+
+	// Hourly fallback poll
+	go func() {
+		ticker := time.NewTicker(pollInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				log.Printf("[cert-sync:%s] Polling Redis...", label)
+				sync(false)
+			}
+		}
+	}()
+
+	// Subscribe for immediate notifications with reconnection logic
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				log.Printf("[cert-sync:%s] Subscribing to %s...", label, redisPubSubChannel)
+				sub := rdb.Subscribe(ctx, redisPubSubChannel)
+
+				func() {
+					defer sub.Close()
+					for {
+						select {
+						case <-ctx.Done():
+							return
+						case msg, ok := <-sub.Channel():
+							if !ok {
+								log.Printf("[cert-sync:%s] Subscription closed, reconnecting...", label)
+								return
+							}
+							log.Printf("[cert-sync:%s] Received update notification (msg: %s), syncing...", label, msg.Payload)
+							sync(false)
+						}
+					}
+				}()
+
+				// Wait before reconnecting
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(5 * time.Second):
+				}
+			}
+		}
+	}()
+
+	// Wait for shutdown signal
+	<-sigChan
+	log.Printf("[cert-sync:%s] Received shutdown signal, exiting gracefully...", label)
+	cancel()
+	time.Sleep(time.Second) // Give goroutines time to clean up
 }
 
 // --- Server ---
@@ -215,10 +303,6 @@ func runClient() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Setup signal handling
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-
 	dockerHTTP := newDockerHTTPClient()
 
 	// Detect the Docker daemon's API version via ping.
@@ -248,22 +332,11 @@ func runClient() {
 	}
 
 	sync := func(forceRestart bool) {
-		var value []byte
-		err := retryWithBackoff(ctx, func() error {
-			var err error
-			value, err = rdb.Get(ctx, redisKey).Bytes()
-			if err == redis.Nil {
-				log.Printf("[cert-sync:client] WARNING: no data found in Redis for key %s", redisKey)
-				return nil // Don't retry for missing key
-			}
-			return err
-		}, "Redis GET")
-
+		value, err := fetchFromRedis(ctx, rdb, redisKey, "client")
 		if err != nil {
 			log.Printf("[cert-sync:client] ERROR: %v", err)
 			return
 		}
-
 		if value == nil {
 			return // No data in Redis
 		}
@@ -295,67 +368,228 @@ func runClient() {
 		restartTraefik()
 	}
 
-	// Initial sync on startup
-	forceRestart, _ := strconv.ParseBool(os.Getenv("CERT_SYNC_FORCE_RESTART"))
-	sync(forceRestart)
+	runSyncDaemon(ctx, cancel, rdb, "client", pollInterval, sync)
+}
 
-	// Hourly fallback poll
-	go func() {
-		ticker := time.NewTicker(pollInterval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				log.Printf("[cert-sync:client] Polling Redis...")
-				sync(false)
+// --- Home Assistant ---
+
+// acmeCertEntry is one entry in a Traefik ACME resolver's Certificates list.
+type acmeCertEntry struct {
+	Domain struct {
+		Main string   `json:"main"`
+		SANs []string `json:"sans,omitempty"`
+	} `json:"domain"`
+	Certificate string `json:"certificate"`
+	Key         string `json:"key"`
+}
+
+type acmeResolverStore struct {
+	Certificates []acmeCertEntry `json:"Certificates"`
+}
+
+// extractCertificate pulls a certificate/key pair out of a Traefik acme.json
+// payload. If domain is empty, the first certificate found across all
+// resolvers is used (matches the single-domain assumption the rest of
+// cert-sync already makes).
+func extractCertificate(data []byte, domain string) (cert, key []byte, err error) {
+	var store map[string]acmeResolverStore
+	if err := json.Unmarshal(data, &store); err != nil {
+		return nil, nil, fmt.Errorf("parse acme store: %w", err)
+	}
+
+	for _, resolver := range store {
+		for _, entry := range resolver.Certificates {
+			if domain != "" && entry.Domain.Main != domain {
+				continue
 			}
+
+			certBytes, err := base64.StdEncoding.DecodeString(entry.Certificate)
+			if err != nil {
+				return nil, nil, fmt.Errorf("decode certificate: %w", err)
+			}
+			keyBytes, err := base64.StdEncoding.DecodeString(entry.Key)
+			if err != nil {
+				return nil, nil, fmt.Errorf("decode key: %w", err)
+			}
+			return certBytes, keyBytes, nil
 		}
-	}()
+	}
 
-	// Subscribe for immediate notifications with reconnection logic
-	go func() {
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			default:
-				log.Printf("[cert-sync:client] Subscribing to %s...", redisPubSubChannel)
-				sub := rdb.Subscribe(ctx, redisPubSubChannel)
+	if domain != "" {
+		return nil, nil, fmt.Errorf("no certificate found for domain %s", domain)
+	}
+	return nil, nil, fmt.Errorf("no certificate found in acme store")
+}
 
-				func() {
-					defer sub.Close()
-					for {
-						select {
-						case <-ctx.Done():
-							return
-						case msg, ok := <-sub.Channel():
-							if !ok {
-								log.Printf("[cert-sync:client] Subscription closed, reconnecting...")
-								return
-							}
-							log.Printf("[cert-sync:client] Received update notification (msg: %s), syncing...", msg.Payload)
-							sync(false)
-						}
-					}
-				}()
+func writeHACertificate(sslDir string, cert, key []byte) error {
+	if err := os.MkdirAll(sslDir, 0755); err != nil {
+		return fmt.Errorf("create ssl dir: %w", err)
+	}
+	if err := os.WriteFile(filepath.Join(sslDir, "fullchain.pem"), cert, 0644); err != nil {
+		return fmt.Errorf("write fullchain.pem: %w", err)
+	}
+	if err := os.WriteFile(filepath.Join(sslDir, "privkey.pem"), key, 0600); err != nil {
+		return fmt.Errorf("write privkey.pem: %w", err)
+	}
+	return nil
+}
 
-				// Wait before reconnecting
+// restartWindow is a daily HH:MM-HH:MM range (host-local time) during which
+// a pending Home Assistant Core restart is allowed to fire. It may wrap past
+// midnight (e.g. 22:00-04:00).
+type restartWindow struct {
+	startMin, endMin int
+}
+
+func parseRestartWindow(s string) (*restartWindow, error) {
+	if s == "" {
+		return nil, nil
+	}
+	parts := strings.SplitN(s, "-", 2)
+	if len(parts) != 2 {
+		return nil, fmt.Errorf("expected format HH:MM-HH:MM, got %q", s)
+	}
+	start, err := parseHHMM(parts[0])
+	if err != nil {
+		return nil, fmt.Errorf("invalid start time: %w", err)
+	}
+	end, err := parseHHMM(parts[1])
+	if err != nil {
+		return nil, fmt.Errorf("invalid end time: %w", err)
+	}
+	return &restartWindow{startMin: start, endMin: end}, nil
+}
+
+func parseHHMM(s string) (int, error) {
+	t, err := time.Parse("15:04", strings.TrimSpace(s))
+	if err != nil {
+		return 0, err
+	}
+	return t.Hour()*60 + t.Minute(), nil
+}
+
+func (w *restartWindow) contains(now time.Time) bool {
+	m := now.Hour()*60 + now.Minute()
+	if w.startMin <= w.endMin {
+		return m >= w.startMin && m < w.endMin
+	}
+	return m >= w.startMin || m < w.endMin // wraps past midnight
+}
+
+// restartCore asks the Supervisor to restart Home Assistant Core. There is
+// no certificate-reload API, so a full restart is the only way to pick up a
+// renewed cert.
+func restartCore(ctx context.Context) error {
+	token := requireEnv("SUPERVISOR_TOKEN")
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://supervisor/core/restart", nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	client := &http.Client{Timeout: 60 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("unexpected status %d", resp.StatusCode)
+	}
+	return nil
+}
+
+func runHomeAssistant() {
+	redisKey := getEnv("REDIS_KEY", defaultRedisKey)
+	sslDir := getEnv("CERT_SYNC_SSL_DIR", defaultSSLDir)
+	domain := os.Getenv("CERT_SYNC_DOMAIN")
+
+	windowRaw := getEnv("CERT_SYNC_RESTART_WINDOW", "")
+	window, err := parseRestartWindow(windowRaw)
+	if err != nil {
+		log.Fatalf("[cert-sync:homeassistant] ERROR: invalid CERT_SYNC_RESTART_WINDOW: %v", err)
+	}
+
+	rdb := newRedisClient()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var pendingRestart atomic.Bool
+
+	applyRestart := func() {
+		if err := restartCore(ctx); err != nil {
+			log.Printf("[cert-sync:homeassistant] ERROR: restarting Core: %v", err)
+			return
+		}
+		pendingRestart.Store(false)
+		log.Printf("[cert-sync:homeassistant] Restarted Home Assistant Core")
+	}
+
+	scheduleRestart := func() {
+		if window == nil {
+			applyRestart()
+			return
+		}
+		pendingRestart.Store(true)
+		log.Printf("[cert-sync:homeassistant] Restart deferred to window %s", windowRaw)
+	}
+
+	sync := func(forceRestart bool) {
+		value, err := fetchFromRedis(ctx, rdb, redisKey, "homeassistant")
+		if err != nil {
+			log.Printf("[cert-sync:homeassistant] ERROR: %v", err)
+			return
+		}
+		if value == nil {
+			return
+		}
+
+		cert, key, err := extractCertificate(value, domain)
+		if err != nil {
+			log.Printf("[cert-sync:homeassistant] ERROR: %v", err)
+			return
+		}
+
+		existingCert, _ := os.ReadFile(filepath.Join(sslDir, "fullchain.pem"))
+		if string(existingCert) == string(cert) {
+			if forceRestart {
+				log.Printf("[cert-sync:homeassistant] certificate unchanged, but force restart requested.")
+				scheduleRestart()
+			} else {
+				log.Printf("[cert-sync:homeassistant] certificate unchanged, skipping restart.")
+			}
+			return
+		}
+
+		if err := writeHACertificate(sslDir, cert, key); err != nil {
+			log.Printf("[cert-sync:homeassistant] ERROR: %v", err)
+			return
+		}
+
+		log.Printf("[cert-sync:homeassistant] Updated certificate in %s", sslDir)
+		scheduleRestart()
+	}
+
+	// Apply a deferred restart once the configured window opens
+	if window != nil {
+		go func() {
+			ticker := time.NewTicker(time.Minute)
+			defer ticker.Stop()
+			for {
 				select {
 				case <-ctx.Done():
 					return
-				case <-time.After(5 * time.Second):
+				case <-ticker.C:
+					if pendingRestart.Load() && window.contains(time.Now()) {
+						applyRestart()
+					}
 				}
 			}
-		}
-	}()
+		}()
+	}
 
-	// Wait for shutdown signal
-	<-sigChan
-	log.Printf("[cert-sync:client] Received shutdown signal, exiting gracefully...")
-	cancel()
-	time.Sleep(time.Second) // Give goroutines time to clean up
+	runSyncDaemon(ctx, cancel, rdb, "homeassistant", defaultPollInterval, sync)
 }
 
 // --- Healthcheck ---
@@ -364,10 +598,22 @@ func runHealthcheck(mode string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	acmeFile := getEnv("TRAEFIK_ACME_FILE", defaultAcmeFile)
-	if _, err := os.Stat(acmeFile); err != nil {
-		fmt.Fprintf(os.Stderr, "acme file: %v\n", err)
-		os.Exit(1)
+	if mode == "homeassistant" {
+		sslDir := getEnv("CERT_SYNC_SSL_DIR", defaultSSLDir)
+		if _, err := os.Stat(filepath.Join(sslDir, "fullchain.pem")); err != nil {
+			fmt.Fprintf(os.Stderr, "ssl cert: %v\n", err)
+			os.Exit(1)
+		}
+		if _, err := os.Stat(filepath.Join(sslDir, "privkey.pem")); err != nil {
+			fmt.Fprintf(os.Stderr, "ssl key: %v\n", err)
+			os.Exit(1)
+		}
+	} else {
+		acmeFile := getEnv("TRAEFIK_ACME_FILE", defaultAcmeFile)
+		if _, err := os.Stat(acmeFile); err != nil {
+			fmt.Fprintf(os.Stderr, "acme file: %v\n", err)
+			os.Exit(1)
+		}
 	}
 
 	rdb := newRedisClient()
@@ -405,7 +651,9 @@ func main() {
 		runServer()
 	case "client":
 		runClient()
+	case "homeassistant":
+		runHomeAssistant()
 	default:
-		log.Fatalf("[cert-sync] ERROR: CERT_SYNC_MODE must be 'server' or 'client', got '%s'", mode)
+		log.Fatalf("[cert-sync] ERROR: CERT_SYNC_MODE must be 'server', 'client', or 'homeassistant', got '%s'", mode)
 	}
 }

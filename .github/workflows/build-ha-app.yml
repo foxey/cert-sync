@@ -1,0 +1,86 @@
+name: Build HA App image
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "cert_sync/**"
+      - "main.go"
+      - "go.mod"
+      - "go.sum"
+  pull_request:
+    paths:
+      - "cert_sync/**"
+      - "main.go"
+      - "go.mod"
+      - "go.sum"
+      - ".github/workflows/build-ha-app.yml"
+  workflow_dispatch: {}
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: version
+        run: |
+          echo "version=$(grep '^version:' cert_sync/config.yaml | sed -E 's/version: *"([^"]+)"/\1/')" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: version
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        include:
+          - ha_arch: amd64
+            platform: linux/amd64
+          - ha_arch: aarch64
+            platform: linux/arm64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        if: github.event_name == 'push'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # Build context is the repo root (not cert_sync/) so the Dockerfile's
+      # COPY of go.mod/go.sum/main.go can find them.
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: cert_sync/Dockerfile
+          platforms: ${{ matrix.platform }}
+          push: ${{ github.event_name == 'push' }}
+          build-args: |
+            BUILD_VERSION=${{ needs.version.outputs.version }}
+            BUILD_ARCH=${{ matrix.ha_arch }}
+          tags: ghcr.io/foxey/cert-sync-homeassistant:${{ needs.version.outputs.version }}-${{ matrix.ha_arch }}
+
+  manifest:
+    needs: [version, build]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    steps:
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish multi-arch manifest
+        run: |
+          docker buildx imagetools create \
+            -t ghcr.io/foxey/cert-sync-homeassistant:${{ needs.version.outputs.version }} \
+            -t ghcr.io/foxey/cert-sync-homeassistant:latest \
+            ghcr.io/foxey/cert-sync-homeassistant:${{ needs.version.outputs.version }}-amd64 \
+            ghcr.io/foxey/cert-sync-homeassistant:${{ needs.version.outputs.version }}-aarch64

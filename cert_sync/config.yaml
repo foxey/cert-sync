@@ -1,0 +1,26 @@
+name: "cert-sync"
+version: "1.0.0"
+slug: "cert_sync"
+description: "Syncs an ACME certificate from Redis directly into Home Assistant Core"
+url: "https://github.com/foxey/cert-sync"
+image: "ghcr.io/foxey/cert-sync-homeassistant"
+arch:
+  - amd64
+  - aarch64
+startup: application
+hassio_api: true
+hassio_role: homeassistant
+map:
+  - ssl:rw
+options:
+  redis_host: "redis"
+  redis_port: 6379
+  redis_password: ""
+  redis_key: "traefik:acme.json"
+schema:
+  redis_host: str
+  redis_port: port
+  redis_password: password
+  redis_key: str
+  domain: str?
+  restart_window: "match(^([01][0-9]|2[0-3]):[0-5][0-9]-([01][0-9]|2[0-3]):[0-5][0-9]$)?"
