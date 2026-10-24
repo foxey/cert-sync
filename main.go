@@ -562,8 +562,15 @@ func runHomeAssistant() {
 	defer cancel()
 
 	var pendingRestart atomic.Bool
+	var restartInFlight atomic.Bool
 
 	applyRestart := func() {
+		if !restartInFlight.CompareAndSwap(false, true) {
+			log.Printf("[cert-sync:homeassistant] Restart already in progress, skipping duplicate request.")
+			return
+		}
+		defer restartInFlight.Store(false)
+
 		if err := restartCore(ctx); err != nil {
 			log.Printf("[cert-sync:homeassistant] ERROR: restarting Core: %v", err)
 			return
