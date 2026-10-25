@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -47,6 +48,19 @@ func requireEnv(key string) string {
 		log.Fatalf("[cert-sync] ERROR: %s environment variable is required", key)
 	}
 	return v
+}
+
+// debugEnabled reports whether CERT_SYNC_DEBUG is set, checked live (rather
+// than cached) since loadHAOptions can set it after process start.
+func debugEnabled() bool {
+	v, _ := strconv.ParseBool(os.Getenv("CERT_SYNC_DEBUG"))
+	return v
+}
+
+func debugf(label, format string, args ...interface{}) {
+	if debugEnabled() {
+		log.Printf("[cert-sync:%s:debug] %s", label, fmt.Sprintf(format, args...))
+	}
 }
 
 func newRedisClient() *redis.Client {
@@ -141,10 +155,12 @@ func fetchFromRedis(ctx context.Context, rdb *redis.Client, redisKey, label stri
 // shared by client and homeassistant modes, performing an initial sync on
 // startup, then blocks until a shutdown signal is received.
 func runSyncDaemon(ctx context.Context, cancel context.CancelFunc, rdb *redis.Client, label string, pollInterval time.Duration, sync func(forceRestart bool)) {
+	startedAt := time.Now()
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
 	forceRestart, _ := strconv.ParseBool(os.Getenv("CERT_SYNC_FORCE_RESTART"))
+	debugf(label, "Starting sync daemon (pollInterval=%v, forceRestart=%v)", pollInterval, forceRestart)
 	sync(forceRestart)
 
 	// Hourly fallback poll
@@ -200,8 +216,8 @@ func runSyncDaemon(ctx context.Context, cancel context.CancelFunc, rdb *redis.Cl
 	}()
 
 	// Wait for shutdown signal
-	<-sigChan
-	log.Printf("[cert-sync:%s] Received shutdown signal, exiting gracefully...", label)
+	sig := <-sigChan
+	log.Printf("[cert-sync:%s] Received shutdown signal (%v) after %v uptime, exiting gracefully...", label, sig, time.Since(startedAt).Round(time.Second))
 	cancel()
 	time.Sleep(time.Second) // Give goroutines time to clean up
 }
@@ -488,14 +504,19 @@ func restartCore(ctx context.Context) error {
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
 
+	debugf("homeassistant", "POST %s", req.URL)
+	start := time.Now()
 	client := &http.Client{Timeout: 60 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
+		debugf("homeassistant", "Core restart request failed after %v: %v", time.Since(start).Round(time.Millisecond), err)
 		return err
 	}
 	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	debugf("homeassistant", "Core restart responded %d in %v: %s", resp.StatusCode, time.Since(start).Round(time.Millisecond), string(body))
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("unexpected status %d", resp.StatusCode)
+		return fmt.Errorf("unexpected status %d: %s", resp.StatusCode, string(body))
 	}
 	return nil
 }
@@ -512,6 +533,7 @@ type haOptions struct {
 	RedisKey      string `json:"redis_key"`
 	Domain        string `json:"domain"`
 	RestartWindow string `json:"restart_window"`
+	Debug         bool   `json:"debug"`
 }
 
 // loadHAOptions reads /data/options.json and applies it on top of the
@@ -542,6 +564,12 @@ func loadHAOptions(path string) {
 	}
 	os.Setenv("CERT_SYNC_DOMAIN", opts.Domain)
 	os.Setenv("CERT_SYNC_RESTART_WINDOW", opts.RestartWindow)
+	os.Setenv("CERT_SYNC_DEBUG", strconv.FormatBool(opts.Debug))
+
+	if opts.Debug {
+		log.Printf("[cert-sync:homeassistant] Debug logging enabled (redis_host=%s redis_port=%s redis_key=%s domain=%s restart_window=%q)",
+			getEnv("REDIS_HOST", defaultRedisHost), getEnv("REDIS_PORT", defaultRedisPort), getEnv("REDIS_KEY", defaultRedisKey), opts.Domain, opts.RestartWindow)
+	}
 }
 
 func runHomeAssistant() {
@@ -581,6 +609,7 @@ func runHomeAssistant() {
 
 	scheduleRestart := func() {
 		if window == nil {
+			debugf("homeassistant", "no restart window configured, restarting immediately")
 			applyRestart()
 			return
 		}
@@ -589,12 +618,14 @@ func runHomeAssistant() {
 	}
 
 	sync := func(forceRestart bool) {
+		debugf("homeassistant", "sync() invoked (forceRestart=%v)", forceRestart)
 		value, err := fetchFromRedis(ctx, rdb, redisKey, "homeassistant")
 		if err != nil {
 			log.Printf("[cert-sync:homeassistant] ERROR: %v", err)
 			return
 		}
 		if value == nil {
+			debugf("homeassistant", "no certificate data in Redis, nothing to do")
 			return
 		}
 
@@ -615,6 +646,7 @@ func runHomeAssistant() {
 			return
 		}
 
+		debugf("homeassistant", "certificate changed (%d bytes -> %d bytes), writing to %s", len(existingCert), len(cert), sslDir)
 		if err := writeHACertificate(sslDir, cert, key); err != nil {
 			log.Printf("[cert-sync:homeassistant] ERROR: %v", err)
 			return
@@ -651,22 +683,27 @@ func runHealthcheck(mode string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
+	debugf(mode, "Running --healthcheck")
+
 	if mode == "homeassistant" {
 		sslDir := getEnv("CERT_SYNC_SSL_DIR", defaultSSLDir)
 		if _, err := os.Stat(filepath.Join(sslDir, "fullchain.pem")); err != nil {
 			fmt.Fprintf(os.Stderr, "ssl cert: %v\n", err)
 			os.Exit(1)
 		}
+		debugf(mode, "ssl cert present")
 		if _, err := os.Stat(filepath.Join(sslDir, "privkey.pem")); err != nil {
 			fmt.Fprintf(os.Stderr, "ssl key: %v\n", err)
 			os.Exit(1)
 		}
+		debugf(mode, "ssl key present")
 	} else {
 		acmeFile := getEnv("TRAEFIK_ACME_FILE", defaultAcmeFile)
 		if _, err := os.Stat(acmeFile); err != nil {
 			fmt.Fprintf(os.Stderr, "acme file: %v\n", err)
 			os.Exit(1)
 		}
+		debugf(mode, "acme file present")
 	}
 
 	rdb := newRedisClient()
@@ -675,6 +712,7 @@ func runHealthcheck(mode string) {
 		fmt.Fprintf(os.Stderr, "redis: %v\n", err)
 		os.Exit(1)
 	}
+	debugf(mode, "redis ping ok")
 
 	if mode == "client" {
 		dockerHTTP := newDockerHTTPClient()
@@ -685,8 +723,10 @@ func runHealthcheck(mode string) {
 			os.Exit(1)
 		}
 		resp.Body.Close()
+		debugf(mode, "docker ping ok")
 	}
 
+	debugf(mode, "healthcheck passed")
 	os.Exit(0)
 }
 
