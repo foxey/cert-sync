@@ -688,42 +688,42 @@ func runHealthcheck(mode string) {
 	if mode == "homeassistant" {
 		sslDir := getEnv("CERT_SYNC_SSL_DIR", defaultSSLDir)
 		if _, err := os.Stat(filepath.Join(sslDir, "fullchain.pem")); err != nil {
-			debugf(mode, "healthcheck failed: ssl cert: %v", err)
 			fmt.Fprintf(os.Stderr, "ssl cert: %v\n", err)
 			os.Exit(1)
 		}
+		debugf(mode, "ssl cert present")
 		if _, err := os.Stat(filepath.Join(sslDir, "privkey.pem")); err != nil {
-			debugf(mode, "healthcheck failed: ssl key: %v", err)
 			fmt.Fprintf(os.Stderr, "ssl key: %v\n", err)
 			os.Exit(1)
 		}
+		debugf(mode, "ssl key present")
 	} else {
 		acmeFile := getEnv("TRAEFIK_ACME_FILE", defaultAcmeFile)
 		if _, err := os.Stat(acmeFile); err != nil {
-			debugf(mode, "healthcheck failed: acme file: %v", err)
 			fmt.Fprintf(os.Stderr, "acme file: %v\n", err)
 			os.Exit(1)
 		}
+		debugf(mode, "acme file present")
 	}
 
 	rdb := newRedisClient()
 	defer rdb.Close()
 	if err := rdb.Ping(ctx).Err(); err != nil {
-		debugf(mode, "healthcheck failed: redis: %v", err)
 		fmt.Fprintf(os.Stderr, "redis: %v\n", err)
 		os.Exit(1)
 	}
+	debugf(mode, "redis ping ok")
 
 	if mode == "client" {
 		dockerHTTP := newDockerHTTPClient()
 		req, _ := http.NewRequestWithContext(ctx, "GET", "http://localhost/_ping", nil)
 		resp, err := dockerHTTP.Do(req)
 		if err != nil {
-			debugf(mode, "healthcheck failed: docker: %v", err)
 			fmt.Fprintf(os.Stderr, "docker: %v\n", err)
 			os.Exit(1)
 		}
 		resp.Body.Close()
+		debugf(mode, "docker ping ok")
 	}
 
 	debugf(mode, "healthcheck passed")
