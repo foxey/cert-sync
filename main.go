@@ -683,6 +683,16 @@ func runHealthcheck(mode string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
+	// Docker runs HEALTHCHECK as a separate process from the main daemon, so
+	// it does not inherit the env vars the daemon derived from
+	// /data/options.json via os.Setenv at startup. Without this, the
+	// healthcheck falls back to default Redis connection settings instead of
+	// the configured ones, fails to reach Redis, and Supervisor's watchdog
+	// kills and restarts the container in a loop.
+	if mode == "homeassistant" {
+		loadHAOptions(getEnv("CERT_SYNC_OPTIONS_FILE", "/data/options.json"))
+	}
+
 	debugf(mode, "Running --healthcheck")
 
 	if mode == "homeassistant" {
