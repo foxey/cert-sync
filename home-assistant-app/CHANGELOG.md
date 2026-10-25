@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.0.4
+- Fix the actual root cause of the recurring "stuck in starting" / repeated
+  restart issue: Docker's `HEALTHCHECK` runs `--healthcheck` as a separate
+  process from the main daemon, so it never inherited the Redis connection
+  settings the daemon derives from `/data/options.json` (only set via
+  `os.Setenv` on the daemon's own process). The healthcheck fell back to
+  the default Redis host, failed to connect, and Supervisor's watchdog
+  killed/restarted the container in a loop — independent of any actual
+  certificate or restart activity. Fixed by having `--healthcheck` read
+  `/data/options.json` itself before running its checks.
+
 ## 1.0.3
 - Add a `debug` option (config form toggle) that enables verbose logging:
   sync() decision tracing, subscribe/healthcheck tracing, and the full
